@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """cmd-help: an offline, no-API-key helper that turns plain English into shell commands."""
 
+import difflib
 import os
 import re
 import select
@@ -316,11 +317,15 @@ def tokenize(text):
 
 
 def infer_path(query):
-    """Guess a real path from folder names mentioned in the query."""
+    """Guess a real path from folder names in the query, tolerating typos."""
     lowered = query.lower()
     for word in _PATH_WORDS:
         if re.search(rf"\b{word}\b", lowered):
             return COMMON_PATHS[word]
+    for token in re.findall(r"[a-z0-9]+", lowered):
+        match = difflib.get_close_matches(token, _PATH_WORDS, n=1, cutoff=0.8)
+        if match:
+            return COMMON_PATHS[match[0]]
     return None
 
 
@@ -341,6 +346,8 @@ def search(query, limit=3):
                 score += 2.0 * weight
             elif any(w in k or k in w for k in keys):
                 score += 1.0 * weight
+            elif difflib.get_close_matches(w, keys, n=1, cutoff=0.8):
+                score += 1.5 * weight  # typo-tolerant match
             if w in desc_words:
                 score += 1.0 * weight
         if score > 0:
