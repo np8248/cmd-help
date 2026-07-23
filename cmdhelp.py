@@ -2,9 +2,11 @@
 """cmd-help: an offline, no-API-key helper that turns plain English into shell commands."""
 
 import difflib
+import json
 import os
 import re
 import select
+import shutil
 import subprocess
 import sys
 
@@ -360,8 +362,61 @@ def search(query, limit=3):
 
 # Slash commands shown when you type "/" at the query prompt.
 SLASH_COMMANDS = [
+    ("/add", "add your own command"),
     ("/exit", "leave cmd-help"),
 ]
+
+# User-defined commands persist here and are merged into the knowledge base.
+CUSTOM_FILE = os.path.expanduser("~/.cmdhelp_commands.json")
+
+# Vocabulary of known words, used for Tab autocomplete / spell-fix.
+VOCAB = set()
+
+
+def load_custom_commands():
+    """Load user commands from CUSTOM_FILE and append them to the knowledge base."""
+    try:
+        with open(CUSTOM_FILE) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return
+    for entry in data:
+        if isinstance(entry, dict) and entry.get("cmd") and entry.get("desc"):
+            entry.setdefault("keywords", [])
+            KNOWLEDGE_BASE.append(entry)
+
+
+def save_custom_command(entry):
+    """Append one command to CUSTOM_FILE, preserving what's already there."""
+    data = []
+    try:
+        with open(CUSTOM_FILE) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = []
+    data.append(entry)
+    with open(CUSTOM_FILE, "w") as fh:
+        json.dump(data, fh, indent=2)
+
+
+def build_vocab():
+    """Collect all known words for autocomplete."""
+    VOCAB.clear()
+    for entry in KNOWLEDGE_BASE:
+        VOCAB.update(entry["keywords"])
+        VOCAB.update(tokenize(entry["desc"]))
+    VOCAB.update(COMMON_PATHS.keys())
+
+
+def complete_word(word):
+    """Return the best completion/correction for a partial word, or None."""
+    if not word:
+        return None
+    prefix = [w for w in VOCAB if w.startswith(word) and w != word]
+    if prefix:
+        return min(prefix, key=len)
+    close = difflib.get_close_matches(word, VOCAB, n=1, cutoff=0.6)
+    return close[0] if close and close[0] != word else None
 
 try:
     import termios
@@ -399,6 +454,12 @@ def read_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+def _fit(text, width):
+    if width < 4:
+        width = 4
+    return text if len(text) <= width else text[: width - 1] + "\u2026"
+
+
 def choose(options):
     """Arrow-key menu over options (list of display strings). Returns index or None."""
     idx = 0
@@ -406,9 +467,11 @@ def choose(options):
     def draw(first):
         if not first:
             sys.stderr.write(f"\x1b[{len(options)}A")
+        cols = shutil.get_terminal_size((80, 24)).columns
         for i, opt in enumerate(options):
             marker = ">" if i == idx else " "
-            body = f"\x1b[7m {opt} \x1b[0m" if i == idx else f" {opt} "
+            shown = _fit(opt, cols - 6)  # keep each row on one physical line
+            body = f"\x1b[7m {shown} \x1b[0m" if i == idx else f" {shown} "
             sys.stderr.write(f"\x1b[2K  {marker}{body}\n")
         sys.stderr.flush()
 
@@ -498,9 +561,18 @@ def prompt_query():
             sys.stderr.write("\n")
             labels = [f"{name}  -  {desc}" for name, desc in SLASH_COMMANDS]
             pick = choose(labels)
-            if pick is not None and SLASH_COMMANDS[pick][0] == "/exit":
-                return QUIT
-            return ""  # menu dismissed, ask again
+            if pick is None:
+                return ""
+            return SLASH_COMMANDS[pick][0]  # e.g. "/exit" or "/add"
+        if key == "\t":
+            parts = buf.split(" ")
+            done = complete_word(parts[-1])
+            if done:
+                parts[-1] = done
+                buf = " ".join(parts)
+                sys.stderr.write("\r\x1b[2K  > " + buf)
+                sys.stderr.flush()
+            continue
         if len(key) == 1 and key.isprintable():
             buf += key
             sys.stderr.write(key)
@@ -602,14 +674,42 @@ def run_command(cmd):
     ui("")
 
 
+def add_command_flow():
+    """Interactively add a user command, saved to CUSTOM_FILE."""
+    ui("\n  add your own command  (esc to cancel)")
+    desc = read_line("description (what it does): ")
+    if desc is QUIT or not desc:
+        ui("  cancelled\n")
+        return
+    cmd = read_line("command (use <name> for blanks): ")
+    if cmd is QUIT or not cmd:
+        ui("  cancelled\n")
+        return
+    kw = read_line("keywords (comma separated, optional): ")
+    if kw is QUIT:
+        ui("  cancelled\n")
+        return
+    keywords = [w.strip().lower() for w in kw.split(",") if w.strip()]
+    if not keywords:
+        keywords = list(dict.fromkeys(tokenize(desc) + tokenize(cmd)))
+    entry = {"desc": desc, "cmd": cmd, "keywords": keywords}
+    KNOWLEDGE_BASE.append(entry)
+    save_custom_command(entry)
+    build_vocab()
+    ui(f"  added: {cmd}\n")
+
+
 def interactive():
     ui("  cmd-help  -  describe what you want, and keep going")
-    ui("  type / for commands, esc to go back, /exit or Ctrl+C to leave\n")
+    ui("  Tab autocompletes, type / for commands, esc to go back, /exit to leave\n")
     while True:
         query = prompt_query()
-        if query is QUIT:
+        if query is QUIT or query == "/exit":
             ui("  bye!")
             return
+        if query == "/add":
+            add_command_flow()
+            continue
         if not query:
             continue
         results = search(query)
@@ -638,6 +738,8 @@ def interactive():
 
 
 def main():
+    load_custom_commands()
+    build_vocab()
     if len(sys.argv) > 1:
         results = search(" ".join(sys.argv[1:]))
         if not results:

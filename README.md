@@ -25,12 +25,19 @@ python3 cmdhelp.py delete a folder # one-off, just prints matches
 ## Interface
 
 - Type your request in plain English, then keep typing new ones after each run.
-- Type `/` to open the command menu (currently just `/exit`).
+- Press **Tab** to autocomplete / spell-fix the word you're typing.
+- Type `/` to open the command menu: `/add` (add your own command) and `/exit`.
 - Move with the **up/down arrows**, choose with **Enter**.
 - Press **Esc** to go back, `/exit` or **Ctrl+C** to leave.
 - The prompt shows your current directory. `cd` persists inside the session
   (but not your outer terminal after you quit, which a child program can't change).
 - `safe` commands run instantly; `caution`/`DANGEROUS` need one `y` keypress.
+
+## Adding your own commands
+
+Pick `/add` from the menu and answer three prompts (description, command,
+keywords). Use `<name>` in the command for values you'll fill in later. Your
+commands are saved to `~/.cmdhelp_commands.json` and loaded every time.
 
 ## Risk labels and smart paths
 
