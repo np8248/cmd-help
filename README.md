@@ -18,6 +18,19 @@ python3 cmdhelp.py delete a folder
 
 Type `quit`, `exit`, or `q` to leave the interactive prompt.
 
+## Make `cd` and shell state actually work (recommended)
+
+A normal program can't change your shell's directory. To let commands like
+`cd` take effect, add this function to your `~/.zshrc` (or `~/.bashrc`):
+
+```sh
+cmdhelp() { eval "$(CMDHELP_EMIT=1 python3 ~/cmdhelp.py "$@")"; }
+```
+
+Then reload (`source ~/.zshrc`) and just run `cmdhelp`. The menu appears,
+and when you approve a command it runs in your current shell, so `cd` sticks.
+Without the wrapper, `python3 cmdhelp.py` still works but `cd` won't persist.
+
 ## Safety and approval
 
 Each suggestion is labeled with a risk level:
@@ -33,10 +46,11 @@ Documents, Pictures, Music, Movies, Home). Press Enter to accept the default.
 In interactive mode you can pick a suggestion to run. Before anything executes:
 
 - placeholders like `<dirname>` are filled in by you,
-- `caution` commands ask `y/N`,
-- `DANGEROUS` commands require you to type `yes` in full.
+- `safe` commands run when you press Enter,
+- `caution` and `DANGEROUS` commands need a `y` (with a clear warning).
 
-Nothing runs without your explicit approval.
+Nothing runs without your approval. Type `exit`, `quit`, `q`, or press Ctrl+C
+at any prompt to leave. After a command runs, the tool exits.
 
 ## How it works
 

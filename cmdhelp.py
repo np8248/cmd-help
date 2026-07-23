@@ -1,9 +1,38 @@
 #!/usr/bin/env python3
 """cmd-help: an offline, no-API-key helper that turns plain English into shell commands."""
 
+import os
 import re
 import subprocess
 import sys
+
+# When run through the shell wrapper (see README), we print the approved
+# command to stdout so the user's own shell can eval it. This is the only
+# way commands like `cd` can affect the current shell.
+EMIT = bool(os.environ.get("CMDHELP_EMIT"))
+
+# Sentinel returned by ask() when the user wants to quit from any prompt.
+QUIT = object()
+
+
+def ui(msg=""):
+    """All interactive text goes to stderr so stdout stays clean for EMIT."""
+    print(msg, file=sys.stderr)
+
+
+def ask(prompt):
+    """Prompt on stderr, read a line. Returns QUIT on exit words, EOF, or Ctrl+C."""
+    try:
+        print(prompt, end="", file=sys.stderr, flush=True)
+        line = sys.stdin.readline()
+    except (EOFError, KeyboardInterrupt):
+        return QUIT
+    if line == "":  # EOF
+        return QUIT
+    line = line.strip()
+    if line.lower() in ("quit", "exit", "q"):
+        return QUIT
+    return line
 
 # Patterns used to classify how risky a command is.
 DANGEROUS_PATTERNS = [
@@ -308,97 +337,121 @@ def search(query, limit=3):
 
 def print_results(results):
     if not results:
-        print("\n  No matching command found. Try different words.\n")
+        ui("\n  No matching command found. Try different words.\n")
         return
-    print("\n  Suggestions:\n")
+    ui("\n  Suggestions:\n")
     for i, entry in enumerate(results, 1):
         risk = classify_risk(entry["cmd"])
-        print(f"  {i}. {entry['desc']}   [{RISK_LABELS[risk]}]")
-        print(f"     $ {entry['cmd']}\n")
+        ui(f"  {i}. {entry['desc']}   [{RISK_LABELS[risk]}]")
+        ui(f"     $ {entry['cmd']}\n")
 
 
 def fill_placeholders(cmd, query=""):
-    """Prompt the user to fill any <placeholder> tokens, guessing paths from context."""
+    """Prompt the user to fill any <placeholder> tokens, guessing paths from context.
+
+    Returns the filled command, or QUIT if the user chose to exit.
+    """
     default_path = infer_path(query)
     tokens = re.findall(r"<[^>]+>", cmd)
     for token in dict.fromkeys(tokens):
         name = token.strip("<>")
         is_pathlike = any(k in name.lower() for k in ("path", "dir", "dest", "source"))
         default = default_path if (default_path and is_pathlike) else None
-        prompt = f"    enter value for {name}"
+        prompt = f"    {name}"
         prompt += f" [{default}]: " if default else ": "
-        value = input(prompt).strip()
+        value = ask(prompt)
+        if value is QUIT:
+            return QUIT
         if not value:
             if default:
                 value = default
             else:
-                print("    (nothing entered, keeping placeholder)")
+                ui("    (nothing entered, keeping placeholder)")
                 continue
         cmd = cmd.replace(token, value)
     return cmd
 
 
 def approve(risk, cmd):
-    """Ask for approval before running. Dangerous commands need a typed 'yes'."""
-    print(f"\n  About to run: {cmd}")
+    """Confirm before running. Minimal typing: safe runs on Enter, others need 'y'."""
+    ui(f"\n  will run: {cmd}")
     if risk == "dangerous":
-        print("  !! This command is DANGEROUS and may delete data or change")
-        print("     permissions/processes. It cannot always be undone.")
-        answer = input("  Type 'yes' to confirm, anything else to cancel: ").strip()
-        return answer.lower() == "yes"
+        ui("  !! DANGEROUS - can delete data or change permissions/processes.")
+        answer = ask("  run it? [y/N]: ")
+        return answer is not QUIT and answer.lower() in ("y", "yes")
     if risk == "caution":
-        print("  !  This command modifies files or state.")
-    answer = input("  Run it? [y/N]: ").strip().lower()
-    return answer in ("y", "yes")
+        ui("  !  modifies files or state.")
+        answer = ask("  run it? [y/N]: ")
+        return answer is not QUIT and answer.lower() in ("y", "yes")
+    answer = ask("  run it? [Y/n]: ")  # safe: Enter = yes
+    return answer is not QUIT and answer.lower() in ("", "y", "yes")
 
 
 def run_selected(results, query=""):
-    """Let the user pick a suggestion to run, gated by risk-based approval."""
-    choice = input("  Run a command? Enter its number (or press Enter to skip): ").strip()
-    if not choice.isdigit():
-        return
-    idx = int(choice) - 1
-    if idx < 0 or idx >= len(results):
-        print("  invalid choice.\n")
-        return
-    entry = results[idx]
-    cmd = fill_placeholders(entry["cmd"], query)
+    """Pick a suggestion and run it. Returns True if a command was executed/emitted."""
+    if len(results) == 1:
+        choice = ask("  run it? Enter = yes, or 'n' to skip: ")
+        if choice is QUIT:
+            return QUIT
+        if choice.lower() in ("n", "no", "skip"):
+            return False
+        idx = 0
+    else:
+        choice = ask("  pick a number to run (Enter to skip): ")
+        if choice is QUIT:
+            return QUIT
+        if not choice.isdigit():
+            return False
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(results):
+            ui("  invalid choice.\n")
+            return False
+
+    cmd = fill_placeholders(results[idx]["cmd"], query)
+    if cmd is QUIT:
+        return QUIT
     if "<" in cmd and ">" in cmd:
-        print("  command still has placeholders, not running.\n")
-        return
-    risk = classify_risk(cmd)
-    if not approve(risk, cmd):
-        print("  cancelled.\n")
-        return
-    print()
-    try:
-        subprocess.run(cmd, shell=True)
-    except Exception as exc:
-        print(f"  failed to run: {exc}")
-    print()
+        ui("  command still has placeholders, not running.\n")
+        return False
+    if not approve(classify_risk(cmd), cmd):
+        ui("  cancelled.\n")
+        return False
+
+    if EMIT:
+        print(cmd)  # stdout -> the shell wrapper will eval this
+    else:
+        ui("")
+        try:
+            subprocess.run(cmd, shell=True)
+        except Exception as exc:
+            ui(f"  failed to run: {exc}")
+    return True
 
 
 def interactive():
-    print("=" * 52)
-    print("  cmd-help  -  offline terminal command suggester")
-    print("=" * 52)
-    print("  Describe what you want to do in plain English.")
-    print("  Type 'quit' or 'exit' to leave.\n")
+    ui("=" * 52)
+    ui("  cmd-help  -  offline terminal command suggester")
+    ui("=" * 52)
+    ui("  Describe what you want to do in plain English.")
+    ui("  Type 'quit', 'exit', or press Ctrl+C to leave.\n")
     while True:
-        try:
-            query = input("  what do you want to do? > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  bye!")
-            break
+        query = ask("  what do you want to do? > ")
+        if query is QUIT:
+            ui("\n  bye!")
+            return
         if not query:
             continue
-        if query.lower() in ("quit", "exit", "q"):
-            print("  bye!")
-            break
         results = search(query)
         print_results(results)
-        if results:
-            run_selected(results, query)
+        if not results:
+            continue
+        outcome = run_selected(results, query)
+        if outcome is QUIT:
+            ui("\n  bye!")
+            return
+        if outcome:  # a command ran; exit so it takes effect in the shell
+            return
+        ui("")
 
 
 def main():
