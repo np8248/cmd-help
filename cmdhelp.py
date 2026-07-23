@@ -277,18 +277,38 @@ GENERIC = {"folder", "file", "files", "directory", "new", "some", "thing", "stuf
 
 # Common folder names we can turn into real paths from the sentence.
 COMMON_PATHS = {
+    "applications": "/Applications",
+    "application": "/Applications",
+    "apps": "/Applications",
+    "app": "/Applications",
+    "programs": "/Applications",
     "downloads": "~/Downloads",
     "download": "~/Downloads",
     "desktop": "~/Desktop",
     "documents": "~/Documents",
     "document": "~/Documents",
+    "docs": "~/Documents",
+    "doc": "~/Documents",
     "pictures": "~/Pictures",
     "picture": "~/Pictures",
+    "pics": "~/Pictures",
+    "pic": "~/Pictures",
+    "photos": "~/Pictures",
+    "photo": "~/Pictures",
     "music": "~/Music",
+    "songs": "~/Music",
     "movies": "~/Movies",
+    "movie": "~/Movies",
+    "videos": "~/Movies",
+    "video": "~/Movies",
+    "library": "~/Library",
+    "trash": "~/.Trash",
     "home": "~",
     "root": "/",
 }
+
+# Longer, more specific words are matched first (e.g. "applications" before "app").
+_PATH_WORDS = sorted(COMMON_PATHS, key=len, reverse=True)
 
 
 def tokenize(text):
@@ -298,9 +318,9 @@ def tokenize(text):
 def infer_path(query):
     """Guess a real path from folder names mentioned in the query."""
     lowered = query.lower()
-    for word, path in COMMON_PATHS.items():
+    for word in _PATH_WORDS:
         if re.search(rf"\b{word}\b", lowered):
-            return path
+            return COMMON_PATHS[word]
     return None
 
 
