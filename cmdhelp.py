@@ -3,12 +3,11 @@
 
 import os
 import re
-import subprocess
+import select
 import sys
 
-# When run through the shell wrapper (see README), we print the approved
-# command to stdout so the user's own shell can eval it. This is the only
-# way commands like `cd` can affect the current shell.
+# When run through the shell wrapper (see README), we print the chosen command
+# to stdout so the user's shell can paste it onto the command line (print -z).
 EMIT = bool(os.environ.get("CMDHELP_EMIT"))
 
 # Sentinel returned by ask() when the user wants to quit from any prompt.
@@ -30,7 +29,7 @@ def ask(prompt):
     if line == "":  # EOF
         return QUIT
     line = line.strip()
-    if line.lower() in ("quit", "exit", "q"):
+    if line.lower() in ("quit", "exit", "q", "/exit", "/quit"):
         return QUIT
     return line
 
@@ -335,128 +334,239 @@ def search(query, limit=3):
     return strong[:limit]
 
 
-def print_results(results):
-    if not results:
-        ui("\n  No matching command found. Try different words.\n")
-        return
-    ui("\n  Suggestions:\n")
-    for i, entry in enumerate(results, 1):
-        risk = classify_risk(entry["cmd"])
-        ui(f"  {i}. {entry['desc']}   [{RISK_LABELS[risk]}]")
-        ui(f"     $ {entry['cmd']}\n")
+# Slash commands shown when you type "/" at the query prompt.
+SLASH_COMMANDS = [
+    ("/exit", "leave cmd-help"),
+]
+
+try:
+    import termios
+    import tty
+    _HAS_TTY = True
+except ImportError:
+    _HAS_TTY = False
 
 
-def fill_placeholders(cmd, query=""):
-    """Prompt the user to fill any <placeholder> tokens, guessing paths from context.
+def rich_mode():
+    """True when we can drive the terminal directly (arrow keys, live input)."""
+    return _HAS_TTY and sys.stdin.isatty() and sys.stderr.isatty()
 
-    Returns the filled command, or QUIT if the user chose to exit.
-    """
-    default_path = infer_path(query)
-    tokens = re.findall(r"<[^>]+>", cmd)
-    for token in dict.fromkeys(tokens):
-        name = token.strip("<>")
-        is_pathlike = any(k in name.lower() for k in ("path", "dir", "dest", "source"))
-        default = default_path if (default_path and is_pathlike) else None
-        prompt = f"    {name}"
-        prompt += f" [{default}]: " if default else ": "
+
+def read_key():
+    """Read a single keypress in raw mode. Returns a name or the character."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = os.read(fd, 1).decode(errors="ignore")
+        if ch == "\x1b":  # escape sequence (arrow keys) or a bare Esc
+            if select.select([fd], [], [], 0.05)[0]:
+                seq = os.read(fd, 2).decode(errors="ignore")
+                return {"[A": "up", "[B": "down", "[C": "right", "[D": "left"}.get(seq, "esc")
+            return "esc"
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        if ch in ("\x7f", "\b"):
+            return "backspace"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def choose(options):
+    """Arrow-key menu over options (list of display strings). Returns index or None."""
+    idx = 0
+
+    def draw(first):
+        if not first:
+            sys.stderr.write(f"\x1b[{len(options)}A")
+        for i, opt in enumerate(options):
+            marker = ">" if i == idx else " "
+            body = f"\x1b[7m {opt} \x1b[0m" if i == idx else f" {opt} "
+            sys.stderr.write(f"\x1b[2K  {marker}{body}\n")
+        sys.stderr.flush()
+
+    draw(first=True)
+    while True:
+        try:
+            key = read_key()
+        except KeyboardInterrupt:
+            return None
+        if key == "up":
+            idx = (idx - 1) % len(options)
+        elif key == "down":
+            idx = (idx + 1) % len(options)
+        elif key == "enter":
+            return idx
+        elif key == "esc":
+            return None
+        else:
+            continue
+        draw(first=False)
+
+
+def read_line(prompt, default=None):
+    """Read a line of text. Returns the text, the default, or QUIT."""
+    if not rich_mode():
         value = ask(prompt)
         if value is QUIT:
             return QUIT
+        return value or (default or "")
+    sys.stderr.write("  " + prompt)
+    sys.stderr.flush()
+    buf = ""
+    while True:
+        try:
+            key = read_key()
+        except KeyboardInterrupt:
+            return QUIT
+        if key == "enter":
+            sys.stderr.write("\n")
+            return buf.strip() or (default or "")
+        if key == "esc":
+            sys.stderr.write("\n")
+            return QUIT
+        if key == "backspace":
+            if buf:
+                buf = buf[:-1]
+                sys.stderr.write("\b \b")
+                sys.stderr.flush()
+            continue
+        if len(key) == 1 and key.isprintable():
+            buf += key
+            sys.stderr.write(key)
+            sys.stderr.flush()
+
+
+def prompt_query():
+    """Query prompt. Typing '/' first opens the slash-command menu."""
+    if not rich_mode():
+        return ask("  what do you want to do?  (type /exit to quit) > ")
+    sys.stderr.write("  what do you want to do?  (type / for commands)\n  > ")
+    sys.stderr.flush()
+    buf = ""
+    while True:
+        try:
+            key = read_key()
+        except KeyboardInterrupt:
+            return QUIT
+        if key == "enter":
+            sys.stderr.write("\n")
+            return buf.strip()
+        if key == "esc":
+            sys.stderr.write("\n")
+            return QUIT
+        if key == "backspace":
+            if buf:
+                buf = buf[:-1]
+                sys.stderr.write("\b \b")
+                sys.stderr.flush()
+            continue
+        if key == "/" and buf == "":
+            sys.stderr.write("\n")
+            labels = [f"{name}  -  {desc}" for name, desc in SLASH_COMMANDS]
+            pick = choose(labels)
+            if pick is not None and SLASH_COMMANDS[pick][0] == "/exit":
+                return QUIT
+            return ""  # menu dismissed, ask again
+        if len(key) == 1 and key.isprintable():
+            buf += key
+            sys.stderr.write(key)
+            sys.stderr.flush()
+
+
+def fill_placeholders(cmd, query=""):
+    """Fill <placeholder> tokens, guessing paths from context. Returns cmd or QUIT."""
+    default_path = infer_path(query)
+    for token in dict.fromkeys(re.findall(r"<[^>]+>", cmd)):
+        name = token.strip("<>")
+        is_pathlike = any(k in name.lower() for k in ("path", "dir", "dest", "source"))
+        default = default_path if (default_path and is_pathlike) else None
+        prompt = f"{name}" + (f" [{default}]: " if default else ": ")
+        value = read_line(prompt, default)
+        if value is QUIT:
+            return QUIT
         if not value:
-            if default:
-                value = default
-            else:
-                ui("    (nothing entered, keeping placeholder)")
-                continue
+            ui("    (kept placeholder)")
+            continue
         cmd = cmd.replace(token, value)
     return cmd
 
 
-def approve(risk, cmd):
-    """Confirm before running. Minimal typing: safe runs on Enter, others need 'y'."""
-    ui(f"\n  will run: {cmd}")
-    if risk == "dangerous":
-        ui("  !! DANGEROUS - can delete data or change permissions/processes.")
-        answer = ask("  run it? [y/N]: ")
-        return answer is not QUIT and answer.lower() in ("y", "yes")
-    if risk == "caution":
-        ui("  !  modifies files or state.")
-        answer = ask("  run it? [y/N]: ")
-        return answer is not QUIT and answer.lower() in ("y", "yes")
-    answer = ask("  run it? [Y/n]: ")  # safe: Enter = yes
-    return answer is not QUIT and answer.lower() in ("", "y", "yes")
+def label_for(entry):
+    risk = classify_risk(entry["cmd"])
+    return f"{entry['cmd']:<34} [{RISK_LABELS[risk]}]  {entry['desc']}"
 
 
-def run_selected(results, query=""):
-    """Pick a suggestion and run it. Returns True if a command was executed/emitted."""
-    if len(results) == 1:
-        choice = ask("  run it? Enter = yes, or 'n' to skip: ")
-        if choice is QUIT:
-            return QUIT
-        if choice.lower() in ("n", "no", "skip"):
-            return False
-        idx = 0
-    else:
-        choice = ask("  pick a number to run (Enter to skip): ")
-        if choice is QUIT:
-            return QUIT
-        if not choice.isdigit():
-            return False
-        idx = int(choice) - 1
-        if idx < 0 or idx >= len(results):
-            ui("  invalid choice.\n")
-            return False
-
-    cmd = fill_placeholders(results[idx]["cmd"], query)
-    if cmd is QUIT:
+def pick_command(results):
+    """Choose a command from results. Returns entry, None (skip), or QUIT."""
+    if rich_mode():
+        ui("  use up/down + enter  (esc to go back)\n")
+        pick = choose([label_for(e) for e in results])
+        return QUIT if pick is None else results[pick]
+    for i, entry in enumerate(results, 1):
+        ui(f"  {i}. {label_for(entry)}")
+    choice = ask("\n  pick a number (Enter to go back): ")
+    if choice is QUIT:
         return QUIT
-    if "<" in cmd and ">" in cmd:
-        ui("  command still has placeholders, not running.\n")
-        return False
-    if not approve(classify_risk(cmd), cmd):
-        ui("  cancelled.\n")
-        return False
+    if not choice.isdigit():
+        return None
+    idx = int(choice) - 1
+    return results[idx] if 0 <= idx < len(results) else None
 
+
+def emit(cmd):
+    """Hand the command back: paste via the shell wrapper, or print it."""
     if EMIT:
-        print(cmd)  # stdout -> the shell wrapper will eval this
+        print(cmd)  # stdout -> wrapper runs `print -z` to paste onto the prompt
     else:
-        ui("")
-        try:
-            subprocess.run(cmd, shell=True)
-        except Exception as exc:
-            ui(f"  failed to run: {exc}")
-    return True
+        ui(f"\n  ready: {cmd}")
+        ui("  (add the shell wrapper from the README to auto-paste this)\n")
+        print(cmd)
 
 
 def interactive():
-    ui("=" * 52)
-    ui("  cmd-help  -  offline terminal command suggester")
-    ui("=" * 52)
-    ui("  Describe what you want to do in plain English.")
-    ui("  Type 'quit', 'exit', or press Ctrl+C to leave.\n")
+    ui("  cmd-help  -  describe what you want, get the command")
+    ui("  type / for commands, esc/Ctrl+C to leave\n")
     while True:
-        query = ask("  what do you want to do? > ")
+        query = prompt_query()
         if query is QUIT:
-            ui("\n  bye!")
+            ui("  bye!")
             return
         if not query:
             continue
         results = search(query)
-        print_results(results)
         if not results:
+            ui("  no match, try different words\n")
             continue
-        outcome = run_selected(results, query)
-        if outcome is QUIT:
-            ui("\n  bye!")
+        chosen = pick_command(results)
+        if chosen is QUIT:
+            ui("  bye!")
             return
-        if outcome:  # a command ran; exit so it takes effect in the shell
+        if chosen is None:
+            ui("")
+            continue
+        cmd = fill_placeholders(chosen["cmd"], query)
+        if cmd is QUIT:
+            ui("  bye!")
             return
-        ui("")
+        if "<" in cmd and ">" in cmd:
+            ui("  still has placeholders, skipping\n")
+            continue
+        emit(cmd)
+        return
 
 
 def main():
     if len(sys.argv) > 1:
-        print_results(search(" ".join(sys.argv[1:])))
+        results = search(" ".join(sys.argv[1:]))
+        if not results:
+            ui("  no match")
+            return
+        for i, entry in enumerate(results, 1):
+            ui(f"  {i}. {label_for(entry)}")
     else:
         interactive()
 

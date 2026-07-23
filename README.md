@@ -2,55 +2,51 @@
 
 An offline terminal command helper. Describe what you want to do in plain English and it suggests the shell command. No API key, no internet, no dependencies (Python 3 only).
 
-## Usage
+## Usage (recommended: shell wrapper)
 
-Interactive menu:
-
-```
-python3 cmdhelp.py
-```
-
-One-off query:
-
-```
-python3 cmdhelp.py delete a folder
-```
-
-Type `quit`, `exit`, or `q` to leave the interactive prompt.
-
-## Make `cd` and shell state actually work (recommended)
-
-A normal program can't change your shell's directory. To let commands like
-`cd` take effect, add this function to your `~/.zshrc` (or `~/.bashrc`):
+Instead of running the command for you, cmd-help **pastes it onto your command
+line**, ready to edit and run. Nothing executes on its own. To enable that, add
+this function to your `~/.zshrc` (zsh is the macOS default):
 
 ```sh
-cmdhelp() { eval "$(CMDHELP_EMIT=1 python3 ~/cmdhelp.py "$@")"; }
+cmdhelp() {
+  local c
+  c="$(CMDHELP_EMIT=1 python3 ~/cmdhelp.py "$@")" || return
+  [ -n "$c" ] && print -z -- "$c"
+}
 ```
 
-Then reload (`source ~/.zshrc`) and just run `cmdhelp`. The menu appears,
-and when you approve a command it runs in your current shell, so `cd` sticks.
-Without the wrapper, `python3 cmdhelp.py` still works but `cd` won't persist.
+Reload with `source ~/.zshrc`, then just type `cmdhelp`. Pick a command and it
+appears on your prompt (with `cd`, paths, etc. already filled in) so you review
+and press Enter yourself. This is why shell state like `cd` works.
 
-## Safety and approval
+You can also run it directly without the wrapper:
 
-Each suggestion is labeled with a risk level:
+```
+python3 cmdhelp.py                 # interactive
+python3 cmdhelp.py delete a folder # one-off, just prints matches
+```
+
+## Interface
+
+- Type your request in plain English.
+- Type `/` to open the command menu (currently just `/exit`).
+- Move with the **up/down arrows**, choose with **Enter**.
+- Press **Esc** or **Ctrl+C** to go back / leave.
+- No typing `y` or `yes`: selecting is the confirmation, and the command is only
+  pasted (never auto-run), so you always get the final say.
+
+## Risk labels and smart paths
+
+Each suggestion is labeled so you can see the risk before choosing:
 
 - `ok safe` - read-only, no changes
 - `!  caution` - modifies files or state (e.g. `mv`, `cp`, `git push`)
 - `!! DANGEROUS` - can delete data or change permissions/processes (e.g. `rm -rf`, `kill`, `chmod`)
 
-It also fills paths from context: if you say "go to my downloads folder" it
-suggests `cd` and pre-fills `~/Downloads` (recognizes Downloads, Desktop,
-Documents, Pictures, Music, Movies, Home). Press Enter to accept the default.
-
-In interactive mode you can pick a suggestion to run. Before anything executes:
-
-- placeholders like `<dirname>` are filled in by you,
-- `safe` commands run when you press Enter,
-- `caution` and `DANGEROUS` commands need a `y` (with a clear warning).
-
-Nothing runs without your approval. Type `exit`, `quit`, `q`, or press Ctrl+C
-at any prompt to leave. After a command runs, the tool exits.
+It also fills paths from context: say "go to my downloads folder" and it
+pre-fills `~/Downloads` (recognizes Downloads, Desktop, Documents, Pictures,
+Music, Movies, Home). Press Enter to accept the default.
 
 ## How it works
 
