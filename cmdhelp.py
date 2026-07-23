@@ -241,6 +241,25 @@ KNOWLEDGE_BASE = [
 STOPWORDS = {
     "a", "an", "the", "to", "of", "in", "on", "for", "how", "do", "i",
     "my", "me", "can", "with", "and", "is", "it", "this", "that", "want",
+    "please", "would", "like", "some",
+}
+
+# Vague words that shouldn't dominate ranking on their own.
+GENERIC = {"folder", "file", "files", "directory", "new", "some", "thing", "stuff"}
+
+# Common folder names we can turn into real paths from the sentence.
+COMMON_PATHS = {
+    "downloads": "~/Downloads",
+    "download": "~/Downloads",
+    "desktop": "~/Desktop",
+    "documents": "~/Documents",
+    "document": "~/Documents",
+    "pictures": "~/Pictures",
+    "picture": "~/Pictures",
+    "music": "~/Music",
+    "movies": "~/Movies",
+    "home": "~",
+    "root": "/",
 }
 
 
@@ -248,25 +267,43 @@ def tokenize(text):
     return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOPWORDS]
 
 
-def search(query, limit=5):
+def infer_path(query):
+    """Guess a real path from folder names mentioned in the query."""
+    lowered = query.lower()
+    for word, path in COMMON_PATHS.items():
+        if re.search(rf"\b{word}\b", lowered):
+            return path
+    return None
+
+
+def search(query, limit=3):
     words = tokenize(query)
     scored = []
     for entry in KNOWLEDGE_BASE:
         keys = set(entry["keywords"])
-        score = 0
+        desc_words = set(tokenize(entry["desc"]))
+        cmd_words = set(tokenize(entry["cmd"]))
+        score = 0.0
         for w in words:
+            weight = 0.5 if w in GENERIC else 1.0
+            if w in cmd_words:
+                # user typed the actual command name (e.g. "grep")
+                score += 3.0
             if w in keys:
-                score += 2
-            else:
-                # partial match (e.g. "deleting" ~ "delete")
-                for k in keys:
-                    if w in k or k in w:
-                        score += 1
-                        break
+                score += 2.0 * weight
+            elif any(w in k or k in w for k in keys):
+                score += 1.0 * weight
+            if w in desc_words:
+                score += 1.0 * weight
         if score > 0:
             scored.append((score, entry))
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [entry for _, entry in scored[:limit]]
+    if not scored:
+        return []
+    top = scored[0][0]
+    # only keep strong matches so a clear winner isn't buried in noise
+    strong = [entry for s, entry in scored if s >= top * 0.6]
+    return strong[:limit]
 
 
 def print_results(results):
@@ -280,15 +317,23 @@ def print_results(results):
         print(f"     $ {entry['cmd']}\n")
 
 
-def fill_placeholders(cmd):
-    """Prompt the user to fill any <placeholder> tokens in a command."""
+def fill_placeholders(cmd, query=""):
+    """Prompt the user to fill any <placeholder> tokens, guessing paths from context."""
+    default_path = infer_path(query)
     tokens = re.findall(r"<[^>]+>", cmd)
     for token in dict.fromkeys(tokens):
         name = token.strip("<>")
-        value = input(f"    enter value for {name}: ").strip()
+        is_pathlike = any(k in name.lower() for k in ("path", "dir", "dest", "source"))
+        default = default_path if (default_path and is_pathlike) else None
+        prompt = f"    enter value for {name}"
+        prompt += f" [{default}]: " if default else ": "
+        value = input(prompt).strip()
         if not value:
-            print("    (nothing entered, keeping placeholder)")
-            continue
+            if default:
+                value = default
+            else:
+                print("    (nothing entered, keeping placeholder)")
+                continue
         cmd = cmd.replace(token, value)
     return cmd
 
@@ -307,7 +352,7 @@ def approve(risk, cmd):
     return answer in ("y", "yes")
 
 
-def run_selected(results):
+def run_selected(results, query=""):
     """Let the user pick a suggestion to run, gated by risk-based approval."""
     choice = input("  Run a command? Enter its number (or press Enter to skip): ").strip()
     if not choice.isdigit():
@@ -317,7 +362,7 @@ def run_selected(results):
         print("  invalid choice.\n")
         return
     entry = results[idx]
-    cmd = fill_placeholders(entry["cmd"])
+    cmd = fill_placeholders(entry["cmd"], query)
     if "<" in cmd and ">" in cmd:
         print("  command still has placeholders, not running.\n")
         return
@@ -353,7 +398,7 @@ def interactive():
         results = search(query)
         print_results(results)
         if results:
-            run_selected(results)
+            run_selected(results, query)
 
 
 def main():

@@ -26,6 +26,10 @@ Each suggestion is labeled with a risk level:
 - `!  caution` - modifies files or state (e.g. `mv`, `cp`, `git push`)
 - `!! DANGEROUS` - can delete data or change permissions/processes (e.g. `rm -rf`, `kill`, `chmod`)
 
+It also fills paths from context: if you say "go to my downloads folder" it
+suggests `cd` and pre-fills `~/Downloads` (recognizes Downloads, Desktop,
+Documents, Pictures, Music, Movies, Home). Press Enter to accept the default.
+
 In interactive mode you can pick a suggestion to run. Before anything executes:
 
 - placeholders like `<dirname>` are filled in by you,
