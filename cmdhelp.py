@@ -5,11 +5,8 @@ import difflib
 import os
 import re
 import select
+import subprocess
 import sys
-
-# When run through the shell wrapper (see README), we print the chosen command
-# to stdout so the user's shell can paste it onto the command line (print -z).
-EMIT = bool(os.environ.get("CMDHELP_EMIT"))
 
 # Sentinel returned by ask() when the user wants to quit from any prompt.
 QUIT = object()
@@ -467,11 +464,17 @@ def read_line(prompt, default=None):
             sys.stderr.flush()
 
 
+def short_cwd():
+    home = os.path.expanduser("~")
+    cwd = os.getcwd()
+    return "~" + cwd[len(home):] if cwd.startswith(home) else cwd
+
+
 def prompt_query():
     """Query prompt. Typing '/' first opens the slash-command menu."""
     if not rich_mode():
-        return ask("  what do you want to do?  (type /exit to quit) > ")
-    sys.stderr.write("  what do you want to do?  (type / for commands)\n  > ")
+        return ask(f"  [{short_cwd()}] what do you want to do? (/exit) > ")
+    sys.stderr.write(f"  [{short_cwd()}]\n  what do you want to do?  (type / for commands)\n  > ")
     sys.stderr.flush()
     buf = ""
     while True:
@@ -557,19 +560,51 @@ def pick_command(results):
     return results[idx] if 0 <= idx < len(results) else None
 
 
-def emit(cmd):
-    """Hand the command back: paste via the shell wrapper, or print it."""
-    if EMIT:
-        print(cmd)  # stdout -> wrapper runs `print -z` to paste onto the prompt
+def confirm(risk):
+    """Safe runs instantly; caution/dangerous need a single 'y' keypress."""
+    if risk == "safe":
+        return True
+    if risk == "dangerous":
+        ui("  !! DANGEROUS - can delete data or change permissions/processes.")
     else:
-        ui(f"\n  ready: {cmd}")
-        ui("  (add the shell wrapper from the README to auto-paste this)\n")
-        print(cmd)
+        ui("  !  modifies files or state.")
+    if rich_mode():
+        sys.stderr.write("  run it? [y/N] ")
+        sys.stderr.flush()
+        try:
+            key = read_key()
+        except KeyboardInterrupt:
+            key = ""
+        sys.stderr.write("\n")
+        return key.lower() == "y"
+    answer = ask("  run it? [y/N] ")
+    return answer is not QUIT and answer.lower() in ("y", "yes")
+
+
+def run_command(cmd):
+    """Run the command in this session. `cd` is handled internally so it persists."""
+    ui(f"\n  $ {cmd}")
+    ui("  " + "-" * 48)
+    cd_match = re.match(r"^\s*cd\s*(.*)$", cmd)
+    if cd_match:
+        target = cd_match.group(1).strip() or "~"
+        target = os.path.expanduser(os.path.expandvars(target))
+        try:
+            os.chdir(target)
+            ui(f"  now in: {short_cwd()}")
+        except OSError as exc:
+            ui(f"  cd failed: {exc}")
+    else:
+        try:
+            subprocess.run(cmd, shell=True)
+        except Exception as exc:  # noqa: BLE001 - surface any run failure
+            ui(f"  failed: {exc}")
+    ui("")
 
 
 def interactive():
-    ui("  cmd-help  -  describe what you want, get the command")
-    ui("  type / for commands, esc/Ctrl+C to leave\n")
+    ui("  cmd-help  -  describe what you want, and keep going")
+    ui("  type / for commands, esc to go back, /exit or Ctrl+C to leave\n")
     while True:
         query = prompt_query()
         if query is QUIT:
@@ -585,18 +620,21 @@ def interactive():
         if chosen is QUIT:
             ui("  bye!")
             return
-        if chosen is None:
+        if chosen is None:  # esc / go back
             ui("")
             continue
         cmd = fill_placeholders(chosen["cmd"], query)
-        if cmd is QUIT:
-            ui("  bye!")
-            return
+        if cmd is QUIT:  # esc while filling = cancel this command
+            ui("  cancelled\n")
+            continue
         if "<" in cmd and ">" in cmd:
             ui("  still has placeholders, skipping\n")
             continue
-        emit(cmd)
-        return
+        if not confirm(classify_risk(cmd)):
+            ui("  cancelled\n")
+            continue
+        run_command(cmd)
+        # loop stays open so you can keep typing
 
 
 def main():
