@@ -520,16 +520,29 @@ def label_for(entry):
     return f"{entry['cmd']:<34} [{RISK_LABELS[risk]}]  {entry['desc']}"
 
 
+EXIT_LABEL = "exit  -  quit cmd-help"
+
+
 def pick_command(results):
-    """Choose a command from results. Returns entry, None (skip), or QUIT."""
+    """Choose a command from results. Returns entry, None (go back), or QUIT."""
     if rich_mode():
-        ui("  use up/down + enter  (esc to go back)\n")
-        pick = choose([label_for(e) for e in results])
-        return QUIT if pick is None else results[pick]
+        ui("")
+        ui("  " + "-" * 48)
+        ui("  CHOOSE A COMMAND   (up/down to move, enter to select)")
+        ui("  " + "-" * 48)
+        options = [label_for(e) for e in results] + [EXIT_LABEL]
+        pick = choose(options)
+        if pick is None:  # esc = go back to the question
+            return None
+        if pick == len(results):  # the exit entry
+            return QUIT
+        return results[pick]
+    ui("\n  choose a command:")
     for i, entry in enumerate(results, 1):
         ui(f"  {i}. {label_for(entry)}")
+    ui("  0. exit")
     choice = ask("\n  pick a number (Enter to go back): ")
-    if choice is QUIT:
+    if choice is QUIT or choice == "0":
         return QUIT
     if not choice.isdigit():
         return None
