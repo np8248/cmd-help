@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """cmd-help: an offline, no-API-key helper that turns plain English into shell commands."""
 
+import contextlib
 import difflib
 import json
 import os
@@ -12,6 +13,45 @@ import sys
 
 # Sentinel returned by ask() when the user wants to quit from any prompt.
 QUIT = object()
+
+# When launched by the shell wrapper, the chosen command is printed to stdout so
+# the wrapper can run it in the real shell (so cd etc. affect your terminal).
+EMIT = bool(os.environ.get("CMDHELP_EMIT"))
+
+CONFIG_FILE = os.path.expanduser("~/.cmdhelp_config.json")
+
+# Color themes for the box. Each has a border color, a selected-row style, and reset.
+THEMES = {
+    "minimal": {"border": "", "sel": "\x1b[7m", "dim": "", "reset": "\x1b[0m"},
+    "cyan": {"border": "\x1b[36m", "sel": "\x1b[30;46m", "dim": "\x1b[2m", "reset": "\x1b[0m"},
+    "green": {"border": "\x1b[32m", "sel": "\x1b[30;42m", "dim": "\x1b[2m", "reset": "\x1b[0m"},
+    "magenta": {"border": "\x1b[35m", "sel": "\x1b[30;45m", "dim": "\x1b[2m", "reset": "\x1b[0m"},
+    "amber": {"border": "\x1b[33m", "sel": "\x1b[30;43m", "dim": "\x1b[2m", "reset": "\x1b[0m"},
+}
+
+CONFIG = {"theme": "minimal"}
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE) as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and data.get("theme") in THEMES:
+            CONFIG["theme"] = data["theme"]
+    except (OSError, ValueError):
+        pass
+
+
+def save_config():
+    try:
+        with open(CONFIG_FILE, "w") as fh:
+            json.dump(CONFIG, fh, indent=2)
+    except OSError:
+        pass
+
+
+def theme():
+    return THEMES.get(CONFIG["theme"], THEMES["minimal"])
 
 
 def ui(msg=""):
@@ -363,6 +403,7 @@ def search(query, limit=3):
 # Slash commands shown when you type "/" at the query prompt.
 SLASH_COMMANDS = [
     ("/add", "add your own command"),
+    ("/settings", "change the theme"),
     ("/exit", "leave cmd-help"),
 ]
 
@@ -431,27 +472,34 @@ def rich_mode():
     return _HAS_TTY and sys.stdin.isatty() and sys.stderr.isatty()
 
 
-def read_key():
-    """Read a single keypress in raw mode. Returns a name or the character."""
+@contextlib.contextmanager
+def raw_mode():
+    """Hold the terminal in raw mode for a whole widget (no per-key flush)."""
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
-        tty.setraw(fd)
-        ch = os.read(fd, 1).decode(errors="ignore")
-        if ch == "\x1b":  # escape sequence (arrow keys) or a bare Esc
-            if select.select([fd], [], [], 0.05)[0]:
-                seq = os.read(fd, 2).decode(errors="ignore")
-                return {"[A": "up", "[B": "down", "[C": "right", "[D": "left"}.get(seq, "esc")
-            return "esc"
-        if ch in ("\r", "\n"):
-            return "enter"
-        if ch == "\x03":
-            raise KeyboardInterrupt
-        if ch in ("\x7f", "\b"):
-            return "backspace"
-        return ch
+        tty.setraw(fd, termios.TCSANOW)
+        yield
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def read_key():
+    """Read one keypress. Assumes raw_mode() is already active."""
+    fd = sys.stdin.fileno()
+    ch = os.read(fd, 1).decode(errors="ignore")
+    if ch == "\x1b":  # escape sequence (arrow keys) or a bare Esc
+        if select.select([fd], [], [], 0.05)[0]:
+            seq = os.read(fd, 2).decode(errors="ignore")
+            return {"[A": "up", "[B": "down", "[C": "right", "[D": "left"}.get(seq, "esc")
+        return "esc"
+    if ch in ("\r", "\n"):
+        return "enter"
+    if ch == "\x03":
+        raise KeyboardInterrupt
+    if ch in ("\x7f", "\b"):
+        return "backspace"
+    return ch
 
 
 def _fit(text, width):
@@ -466,32 +514,33 @@ def choose(options):
 
     def draw(first):
         if not first:
-            sys.stderr.write(f"\x1b[{len(options)}A")
+            sys.stderr.write(f"\r\x1b[{len(options)}A")
         cols = shutil.get_terminal_size((80, 24)).columns
         for i, opt in enumerate(options):
             marker = ">" if i == idx else " "
             shown = _fit(opt, cols - 6)  # keep each row on one physical line
             body = f"\x1b[7m {shown} \x1b[0m" if i == idx else f" {shown} "
-            sys.stderr.write(f"\x1b[2K  {marker}{body}\n")
+            sys.stderr.write(f"\x1b[2K  {marker}{body}\r\n")
         sys.stderr.flush()
 
-    draw(first=True)
-    while True:
-        try:
-            key = read_key()
-        except KeyboardInterrupt:
-            return None
-        if key == "up":
-            idx = (idx - 1) % len(options)
-        elif key == "down":
-            idx = (idx + 1) % len(options)
-        elif key == "enter":
-            return idx
-        elif key == "esc":
-            return None
-        else:
-            continue
-        draw(first=False)
+    with raw_mode():
+        draw(first=True)
+        while True:
+            try:
+                key = read_key()
+            except KeyboardInterrupt:
+                return None
+            if key == "up":
+                idx = (idx - 1) % len(options)
+            elif key == "down":
+                idx = (idx + 1) % len(options)
+            elif key == "enter":
+                return idx
+            elif key == "esc":
+                return None
+            else:
+                continue
+            draw(first=False)
 
 
 def read_line(prompt, default=None):
@@ -504,27 +553,28 @@ def read_line(prompt, default=None):
     sys.stderr.write("  " + prompt)
     sys.stderr.flush()
     buf = ""
-    while True:
-        try:
-            key = read_key()
-        except KeyboardInterrupt:
-            return QUIT
-        if key == "enter":
-            sys.stderr.write("\n")
-            return buf.strip() or (default or "")
-        if key == "esc":
-            sys.stderr.write("\n")
-            return QUIT
-        if key == "backspace":
-            if buf:
-                buf = buf[:-1]
-                sys.stderr.write("\b \b")
+    with raw_mode():
+        while True:
+            try:
+                key = read_key()
+            except KeyboardInterrupt:
+                return QUIT
+            if key == "enter":
+                sys.stderr.write("\r\n")
+                return buf.strip() or (default or "")
+            if key == "esc":
+                sys.stderr.write("\r\n")
+                return QUIT
+            if key == "backspace":
+                if buf:
+                    buf = buf[:-1]
+                    sys.stderr.write("\b \b")
+                    sys.stderr.flush()
+                continue
+            if len(key) == 1 and key.isprintable():
+                buf += key
+                sys.stderr.write(key)
                 sys.stderr.flush()
-            continue
-        if len(key) == 1 and key.isprintable():
-            buf += key
-            sys.stderr.write(key)
-            sys.stderr.flush()
 
 
 def short_cwd():
@@ -533,50 +583,103 @@ def short_cwd():
     return "~" + cwd[len(home):] if cwd.startswith(home) else cwd
 
 
-def prompt_query():
-    """Query prompt. Typing '/' first opens the slash-command menu."""
-    if not rich_mode():
-        return ask(f"  [{short_cwd()}] what do you want to do? (/exit) > ")
-    sys.stderr.write(f"  [{short_cwd()}]\n  what do you want to do?  (type / for commands)\n  > ")
+def _pad(text, width):
+    if len(text) > width:
+        text = text[: width - 1] + "\u2026"
+    return text + " " * (width - len(text))
+
+
+def box_lines(query, items, idx, hint):
+    """Build the bordered box: input line on top, suggestions grow below."""
+    t = theme()
+    b, r, sel, dim = t["border"], t["reset"], t["sel"], t["dim"]
+    cols = shutil.get_terminal_size((80, 24)).columns
+    inner = max(28, min(cols - 4, 96))
+    H, V = "\u2500", "\u2502"
+    TL, TR, BL, BR = "\u256d", "\u256e", "\u2570", "\u256f"
+    ML, MR = "\u251c", "\u2524"
+    out = [b + TL + H * inner + TR + r]
+    out.append(b + V + r + _pad(" \u203a " + query + "\u2588", inner) + b + V + r)
+    if items:
+        out.append(b + ML + H * inner + MR + r)
+        for i, it in enumerate(items):
+            content = _pad("  " + it, inner)
+            if i == idx:
+                out.append(b + V + r + sel + content + r + b + V + r)
+            else:
+                out.append(b + V + r + content + b + V + r)
+    out.append(b + BL + H * inner + BR + r)
+    if hint:
+        out.append(dim + "  " + _fit(hint, inner) + r)
+    return out
+
+
+def render(lines, prev):
+    sys.stderr.write("\r")
+    if prev > 1:
+        sys.stderr.write(f"\x1b[{prev - 1}A")
+    sys.stderr.write("\x1b[0J")
+    sys.stderr.write("\r\n".join(lines))
     sys.stderr.flush()
-    buf = ""
-    while True:
-        try:
-            key = read_key()
-        except KeyboardInterrupt:
-            return QUIT
-        if key == "enter":
-            sys.stderr.write("\n")
-            return buf.strip()
-        if key == "esc":
-            sys.stderr.write("\n")
-            return QUIT
-        if key == "backspace":
-            if buf:
-                buf = buf[:-1]
-                sys.stderr.write("\b \b")
-                sys.stderr.flush()
-            continue
-        if key == "/" and buf == "":
-            sys.stderr.write("\n")
-            labels = [f"{name}  -  {desc}" for name, desc in SLASH_COMMANDS]
-            pick = choose(labels)
-            if pick is None:
-                return ""
-            return SLASH_COMMANDS[pick][0]  # e.g. "/exit" or "/add"
-        if key == "\t":
-            parts = buf.split(" ")
-            done = complete_word(parts[-1])
-            if done:
-                parts[-1] = done
-                buf = " ".join(parts)
-                sys.stderr.write("\r\x1b[2K  > " + buf)
-                sys.stderr.flush()
-            continue
-        if len(key) == 1 and key.isprintable():
-            buf += key
-            sys.stderr.write(key)
-            sys.stderr.flush()
+    return len(lines)
+
+
+def box_session():
+    """Live box: type to search, arrows to select, enter to choose.
+
+    Returns ("entry", entry, query), ("slash", name, query), or None (quit).
+    """
+    sys.stderr.write("\x1b[?25l")
+    prev = 0
+    query = ""
+    idx = 0
+    hint = "type to search   up/down select   enter run   / menu   tab complete   esc quit"
+    try:
+      with raw_mode():
+        while True:
+            slash = query.startswith("/")
+            if slash:
+                matches = [(n, d) for n, d in SLASH_COMMANDS if n.startswith(query) or query == "/"]
+                display = [f"{n}   {d}" for n, d in matches]
+                entries = []
+            else:
+                entries = search(query) if query.strip() else []
+                display = [label_for(e) for e in entries]
+            if idx >= len(display):
+                idx = max(0, len(display) - 1)
+            prev = render(box_lines(query, display, idx, hint), prev)
+            try:
+                key = read_key()
+            except KeyboardInterrupt:
+                return None
+            if key == "esc":
+                return None
+            if key == "enter":
+                if not display:
+                    continue
+                if slash:
+                    return ("slash", matches[idx][0], query)
+                return ("entry", entries[idx], query)
+            if key == "up" and display:
+                idx = (idx - 1) % len(display)
+            elif key == "down" and display:
+                idx = (idx + 1) % len(display)
+            elif key == "backspace":
+                query = query[:-1]
+                idx = 0
+            elif key == "\t":
+                parts = query.split(" ")
+                done = complete_word(parts[-1])
+                if done:
+                    parts[-1] = done
+                    query = " ".join(parts)
+                idx = 0
+            elif len(key) == 1 and key.isprintable():
+                query += key
+                idx = 0
+    finally:
+        sys.stderr.write("\x1b[?25h\r\n")
+        sys.stderr.flush()
 
 
 def fill_placeholders(cmd, query=""):
@@ -644,34 +747,54 @@ def confirm(risk):
         sys.stderr.write("  run it? [y/N] ")
         sys.stderr.flush()
         try:
-            key = read_key()
+            with raw_mode():
+                key = read_key()
         except KeyboardInterrupt:
             key = ""
-        sys.stderr.write("\n")
+        sys.stderr.write("\r\n")
         return key.lower() == "y"
     answer = ask("  run it? [y/N] ")
     return answer is not QUIT and answer.lower() in ("y", "yes")
 
 
-def run_command(cmd):
-    """Run the command in this session. `cd` is handled internally so it persists."""
-    ui(f"\n  $ {cmd}")
-    ui("  " + "-" * 48)
+def run_in_session(cmd):
+    """Run a command in-process (direct mode). `cd` handled so it persists here."""
     cd_match = re.match(r"^\s*cd\s*(.*)$", cmd)
     if cd_match:
-        target = cd_match.group(1).strip() or "~"
-        target = os.path.expanduser(os.path.expandvars(target))
+        target = os.path.expanduser(os.path.expandvars(cd_match.group(1).strip() or "~"))
         try:
             os.chdir(target)
-            ui(f"  now in: {short_cwd()}")
         except OSError as exc:
             ui(f"  cd failed: {exc}")
-    else:
-        try:
-            subprocess.run(cmd, shell=True)
-        except Exception as exc:  # noqa: BLE001 - surface any run failure
-            ui(f"  failed: {exc}")
-    ui("")
+        return
+    try:
+        subprocess.run(cmd, shell=True)
+    except Exception as exc:  # noqa: BLE001 - surface any run failure
+        ui(f"  failed: {exc}")
+
+
+def deliver(cmd):
+    """Hand off the command. EMIT: print for the wrapper to run in the real shell
+    (so cd affects your terminal and the box reopens). Otherwise run in-process.
+    Returns True when the process should exit (EMIT hand-off)."""
+    if EMIT:
+        print(cmd)
+        return True
+    run_in_session(cmd)
+    return False
+
+
+def settings_flow():
+    """Pick a color theme; saved to CONFIG_FILE."""
+    names = list(THEMES)
+    labels = [n + ("  (current)" if n == CONFIG["theme"] else "") for n in names]
+    ui("\n  choose a theme:")
+    pick = choose(labels)
+    if pick is None:
+        return
+    CONFIG["theme"] = names[pick]
+    save_config()
+    ui(f"  theme set to {names[pick]}\n")
 
 
 def add_command_flow():
@@ -699,16 +822,44 @@ def add_command_flow():
     ui(f"  added: {cmd}\n")
 
 
-def interactive():
-    ui("  cmd-help  -  describe what you want, and keep going")
-    ui("  Tab autocompletes, type / for commands, esc to go back, /exit to leave\n")
+def _run_choice(entry, query):
+    """Fill placeholders, confirm, deliver. Returns True if process should exit."""
+    cmd = fill_placeholders(entry["cmd"], query)
+    if cmd is QUIT or ("<" in cmd and ">" in cmd):
+        return False
+    if not confirm(classify_risk(cmd)):
+        return False
+    return deliver(cmd)
+
+
+def rich_loop():
     while True:
-        query = prompt_query()
-        if query is QUIT or query == "/exit":
-            ui("  bye!")
+        action = box_session()
+        if action is None:
+            return
+        kind, val, query = action
+        if kind == "slash":
+            if val == "/exit":
+                return
+            if val == "/add":
+                add_command_flow()
+            elif val == "/settings":
+                settings_flow()
+            continue
+        if _run_choice(val, query):
+            return  # EMIT hand-off: wrapper runs it and relaunches the box
+
+
+def fallback_loop():
+    while True:
+        query = ask("  what do you want to do? (/exit) > ")
+        if query is QUIT:
             return
         if query == "/add":
             add_command_flow()
+            continue
+        if query == "/settings":
+            settings_flow()
             continue
         if not query:
             continue
@@ -718,26 +869,22 @@ def interactive():
             continue
         chosen = pick_command(results)
         if chosen is QUIT:
-            ui("  bye!")
             return
-        if chosen is None:  # esc / go back
-            ui("")
+        if chosen is None:
             continue
-        cmd = fill_placeholders(chosen["cmd"], query)
-        if cmd is QUIT:  # esc while filling = cancel this command
-            ui("  cancelled\n")
-            continue
-        if "<" in cmd and ">" in cmd:
-            ui("  still has placeholders, skipping\n")
-            continue
-        if not confirm(classify_risk(cmd)):
-            ui("  cancelled\n")
-            continue
-        run_command(cmd)
-        # loop stays open so you can keep typing
+        if _run_choice(chosen, query):
+            return
+
+
+def interactive():
+    if rich_mode():
+        rich_loop()
+    else:
+        fallback_loop()
 
 
 def main():
+    load_config()
     load_custom_commands()
     build_vocab()
     if len(sys.argv) > 1:
