@@ -10,6 +10,8 @@ import select
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 # Sentinel returned by ask() when the user wants to quit from any prompt.
 QUIT = object()
@@ -29,17 +31,29 @@ THEMES = {
     "amber": {"border": "\x1b[33m", "sel": "\x1b[30;43m", "dim": "\x1b[2m", "reset": "\x1b[0m"},
 }
 
-CONFIG = {"theme": "minimal"}
+CONFIG = {"theme": "minimal", "use_llm": True, "model": "llama3.2:3b"}
+
+# Local Ollama endpoint + model. Override via env for quick experiments.
+OLLAMA_URL = os.environ.get("CMDHELP_OLLAMA", "http://localhost:11434")
 
 
 def load_config():
     try:
         with open(CONFIG_FILE) as fh:
             data = json.load(fh)
-        if isinstance(data, dict) and data.get("theme") in THEMES:
-            CONFIG["theme"] = data["theme"]
+        if isinstance(data, dict):
+            if data.get("theme") in THEMES:
+                CONFIG["theme"] = data["theme"]
+            if isinstance(data.get("use_llm"), bool):
+                CONFIG["use_llm"] = data["use_llm"]
+            if isinstance(data.get("model"), str) and data["model"]:
+                CONFIG["model"] = data["model"]
     except (OSError, ValueError):
         pass
+    if os.environ.get("CMDHELP_MODEL"):
+        CONFIG["model"] = os.environ["CMDHELP_MODEL"]
+    if os.environ.get("CMDHELP_NO_LLM"):
+        CONFIG["use_llm"] = False
 
 
 def save_config():
@@ -400,8 +414,87 @@ def search(query, limit=3):
     return strong[:limit]
 
 
+# --- Local LLM (Ollama) --------------------------------------------------
+# Primary engine when a local Ollama server is running; the keyword search
+# above is the fallback whenever the model is unavailable or fails.
+
+_LLM_OK = None  # cached availability for the life of the process
+
+LLM_INSTRUCTIONS = (
+    "You translate a plain-English request into safe shell commands for a Unix "
+    "shell (macOS/Linux). Reply with ONLY JSON of the form "
+    '{"commands": [{"cmd": "...", "desc": "..."}]}. Give at most 3 commands, '
+    "best first. Use <name> placeholders for values the user must fill in "
+    "(e.g. <path>, <file>). Do not invent flags; prefer standard tools. No prose."
+)
+
+
+def ollama_available():
+    """True if a local Ollama server answers quickly and LLM use is enabled."""
+    global _LLM_OK
+    if _LLM_OK is not None:
+        return _LLM_OK
+    if not CONFIG.get("use_llm", True):
+        _LLM_OK = False
+        return False
+    try:
+        urllib.request.urlopen(OLLAMA_URL + "/api/tags", timeout=0.4).read()
+        _LLM_OK = True
+    except Exception:  # noqa: BLE001 - any failure means "just use keywords"
+        _LLM_OK = False
+    return _LLM_OK
+
+
+def _parse_llm_json(text, limit):
+    """Pull command entries out of the model's JSON reply. Returns [] on junk."""
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return []
+    if isinstance(parsed, dict):
+        items = parsed.get("commands") or parsed.get("results") or []
+    elif isinstance(parsed, list):
+        items = parsed
+    else:
+        items = []
+    out = []
+    for it in items:
+        if isinstance(it, dict) and str(it.get("cmd", "")).strip():
+            out.append({
+                "cmd": str(it["cmd"]).strip(),
+                "desc": str(it.get("desc", "")).strip() or "AI suggestion",
+                "keywords": [],
+            })
+    return out[:limit]
+
+
+def llm_search(query, limit=3):
+    """Ask local Ollama to turn the query into commands. None if unavailable."""
+    if not query.strip() or not ollama_available():
+        return None
+    body = json.dumps({
+        "model": CONFIG.get("model", "llama3.2:3b"),
+        "prompt": f"{LLM_INSTRUCTIONS}\n\nRequest: {query}\nJSON:",
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.1},
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            OLLAMA_URL + "/api/generate", data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = json.load(resp)
+    except Exception:  # noqa: BLE001 - fall back to keyword search on any error
+        return None
+    results = _parse_llm_json(data.get("response", ""), limit)
+    return results or None
+
+
 # Slash commands shown when you type "/" at the query prompt.
 SLASH_COMMANDS = [
+    ("/back", "go back to search"),
     ("/add", "add your own command"),
     ("/settings", "change the theme"),
     ("/exit", "leave cmd-help"),
@@ -615,13 +708,22 @@ def box_lines(query, items, idx, hint):
 
 
 def render(lines, prev):
-    sys.stderr.write("\r")
-    if prev > 1:
-        sys.stderr.write(f"\x1b[{prev - 1}A")
-    sys.stderr.write("\x1b[0J")
+    """Draw the box anchored to the bottom of the terminal.
+
+    The box's bottom edge sits on the last row; as suggestions appear it grows
+    upward instead of pushing content down, so the input line stays put.
+    """
+    rows = shutil.get_terminal_size((80, 24)).lines
+    height = len(lines)
+    top = max(1, rows - height + 1)
+    old_top = max(1, rows - prev + 1) if prev else top
+    clear_top = min(top, old_top)
+    # Clear the whole region the box could occupy, then draw at the anchored top.
+    sys.stderr.write(f"\x1b[{clear_top};1H\x1b[0J")
+    sys.stderr.write(f"\x1b[{top};1H")
     sys.stderr.write("\r\n".join(lines))
     sys.stderr.flush()
-    return len(lines)
+    return height
 
 
 def box_session():
@@ -633,7 +735,22 @@ def box_session():
     prev = 0
     query = ""
     idx = 0
-    hint = "type to search   up/down select   enter run   / menu   tab complete   esc quit"
+    navigated = False  # True once the user arrows onto a specific suggestion
+
+    def ask_ai():
+        """Show a waiting line and ask the local LLM. Returns entries or None."""
+        nonlocal prev
+        if not query.strip():
+            return None
+        prev = render(box_lines(query, display, idx, "asking the AI\u2026  please wait"), prev)
+        return llm_search(query)
+
+    ai_on = ollama_available()
+    hint = (
+        "type search   up/down pick   enter ask AI   ^a force AI   / menu   esc quit"
+        if ai_on else
+        "type to search   up/down select   enter run   / menu   tab complete   esc quit"
+    )
     try:
       with raw_mode():
         while True:
@@ -655,18 +772,35 @@ def box_session():
             if key == "esc":
                 return None
             if key == "enter":
-                if not display:
-                    continue
                 if slash:
+                    if not display:
+                        continue
                     return ("slash", matches[idx][0], query)
-                return ("entry", entries[idx], query)
+                # Explicitly navigated to a known command: run it directly.
+                if navigated and display:
+                    return ("entry", entries[idx], query)
+                # LLM primary: interpret the query; fall back to keyword hits.
+                ai = ask_ai()
+                if ai:
+                    return ("results", ai, query) if len(ai) > 1 else ("entry", ai[0], query)
+                if display:
+                    return ("entry", entries[idx], query)
+                continue
+            if key == "\x01" and not slash:  # Ctrl+A: force the AI
+                ai = ask_ai()
+                if ai:
+                    return ("results", ai, query) if len(ai) > 1 else ("entry", ai[0], query)
+                continue
             if key == "up" and display:
                 idx = (idx - 1) % len(display)
+                navigated = True
             elif key == "down" and display:
                 idx = (idx + 1) % len(display)
+                navigated = True
             elif key == "backspace":
                 query = query[:-1]
                 idx = 0
+                navigated = False
             elif key == "\t":
                 parts = query.split(" ")
                 done = complete_word(parts[-1])
@@ -674,11 +808,19 @@ def box_session():
                     parts[-1] = done
                     query = " ".join(parts)
                 idx = 0
+                navigated = False
             elif len(key) == 1 and key.isprintable():
                 query += key
                 idx = 0
+                navigated = False
     finally:
-        sys.stderr.write("\x1b[?25h\r\n")
+        # Erase the bottom-anchored box so relaunches don't stack a trail of old
+        # boxes; only the chosen command's output stays, one fresh box at bottom.
+        if prev:
+            rows = shutil.get_terminal_size((80, 24)).lines
+            top = max(1, rows - prev + 1)
+            sys.stderr.write(f"\x1b[{top};1H\x1b[0J")
+        sys.stderr.write("\x1b[?25h")
         sys.stderr.flush()
 
 
@@ -785,7 +927,19 @@ def deliver(cmd):
 
 
 def settings_flow():
-    """Pick a color theme; saved to CONFIG_FILE."""
+    """Pick a color theme or toggle the local-LLM engine; saved to CONFIG_FILE."""
+    ui("\n  settings:")
+    ai_state = "on" if CONFIG.get("use_llm", True) else "off"
+    top = choose(["theme", f"AI engine (currently {ai_state})"])
+    if top is None:
+        return
+    if top == 1:
+        CONFIG["use_llm"] = not CONFIG.get("use_llm", True)
+        global _LLM_OK
+        _LLM_OK = None  # re-check availability next time
+        save_config()
+        ui(f"  AI engine turned {'on' if CONFIG['use_llm'] else 'off'}\n")
+        return
     names = list(THEMES)
     labels = [n + ("  (current)" if n == CONFIG["theme"] else "") for n in names]
     ui("\n  choose a theme:")
@@ -846,6 +1000,15 @@ def rich_loop():
             elif val == "/settings":
                 settings_flow()
             continue
+        if kind == "results":  # multiple AI suggestions: let the user pick one
+            chosen = pick_command(val)
+            if chosen is QUIT:
+                return
+            if chosen is None:
+                continue
+            if _run_choice(chosen, query):
+                return
+            continue
         if _run_choice(val, query):
             return  # EMIT hand-off: wrapper runs it and relaunches the box
 
@@ -863,7 +1026,7 @@ def fallback_loop():
             continue
         if not query:
             continue
-        results = search(query)
+        results = llm_search(query) or search(query)
         if not results:
             ui("  no match, try different words\n")
             continue
